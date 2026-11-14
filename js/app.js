@@ -6,7 +6,7 @@ import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import { parseAmount, formatAmount, splitIngredientLine } from './amount.js';
 import { buildSynonymMap, matchRecipe } from './search.js';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.2.0';
 const CATEGORIES = ['主菜', '副菜', '汁物', 'ご飯・麺・パン', 'おやつ', 'その他'];
 const SOURCE_TYPES = { original: 'オリジナル', url: 'ウェブサイト', book: '料理本', photo: '写真・スクショ' };
 const SORTS = { new: '新しく登録した順', often: 'よく作る順', stale: '最近作っていない順' };
@@ -35,6 +35,7 @@ const state = {
   loaded: false,
 };
 let edit = null;    // 登録・編集中のデータ
+let photoPicks = []; // 写真取り込みで選んだ写真
 let wakeLock = null;
 
 // ---------------------------------------------------------------
@@ -212,7 +213,7 @@ async function afterLogin() {
     const wasLoaded = state.loaded;
     state.loaded = true;
     // 入力中の登録・編集画面は描き直さない
-    if (!(wasLoaded && /^#\/(new|edit|import)/.test(location.hash))) route();
+    if (!(wasLoaded && /^#\/(new|edit|import|photo)/.test(location.hash))) route();
   } catch (e) {
     console.warn(e);
     if (cached) toast('オフラインのため、保存済みのデータを表示しています');
@@ -264,6 +265,7 @@ function route() {
   if (parts[0] === 'edit' && parts[1]) return renderEdit(parts[1]);
   if (parts[0] === 'new') return renderEdit(null);
   if (parts[0] === 'import') return renderImport();
+  if (parts[0] === 'photo') return renderPhotoImport();
   if (parts[0] === 'settings') return renderSettings();
   renderList();
 }
@@ -297,7 +299,7 @@ function renderList() {
         <h2>レシピを追加</h2>
         <a class="sheet-item" href="#/new">✏️ 手入力で登録</a>
         <a class="sheet-item" href="#/import">🔗 URLから取り込む</a>
-        <div class="sheet-item disabled">📷 写真から取り込む（第2段階で追加予定）</div>
+        <a class="sheet-item" href="#/photo">📷 写真から取り込む</a>
         <button type="button" class="btn" id="sheetClose">閉じる</button>
       </div>
     </div>`;
@@ -545,9 +547,10 @@ function renderEdit(id) {
       id: null, title: d.title ?? '', category: d.category ?? '主菜', servings_base: d.servings_base ?? 2,
       cook_time_min: '', tags: '', source_type: d.source_type ?? 'original',
       source_url: d.source_url ?? '', source_name: d.source_name ?? '', family_note: '',
+      fromAi: !!d.fromAi,
       ingredients: d.ingredients?.length ? d.ingredients : [blankIngredient(), blankIngredient(), blankIngredient()],
       steps: d.steps?.length ? d.steps : ['', ''],
-      images: [], removedImages: [], newImages: [],
+      images: [], removedImages: [], newImages: d.newImages ?? [],
     };
   }
   drawEdit();
@@ -563,6 +566,7 @@ function drawEdit() {
     </header>
     ${offlineBanner()}
     <form id="editForm" class="pad form" autocomplete="off">
+      ${e.fromAi ? '<p class="notice">AIで読み取った内容です。材料・分量・手順に読み間違いがないか確認してから保存してください。</p>' : ''}
       <label><span class="lt">レシピ名<span class="req">必須</span></span>
         <input data-k="title" value="${esc(e.title)}" required placeholder="例：豚の生姜焼き">
       </label>
@@ -820,10 +824,11 @@ function renderImport() {
         <input id="url" type="url" inputmode="url" required placeholder="https://">
       </label>
       <button class="btn primary big" id="go">取り込む</button>
-      <p class="hint">クックパッド、クラシル、デリッシュキッチンなどの多くのレシピサイトに対応しています。
+      <p class="hint">クックパッドやクラシルなどの大手サイトはすぐに読み取れます。
+      それ以外のサイトは、ページの本文をAIで読み取ります（少し時間がかかります）。
       読み取った内容は登録画面で確認・修正してから保存します。</p>
       <p class="hint">InstagramやTikTokなどのSNSは読み取れないことが多いです。その場合はスクショを撮り、
-      手入力の登録画面で「元のレシピの写真」として保存してください。</p>
+      「写真から取り込む」を使ってください。</p>
     </form>`;
   $('#importForm').onsubmit = async ev => {
     ev.preventDefault();
@@ -831,19 +836,13 @@ function renderImport() {
     const url = $('#url').value.trim();
     const btn = $('#go');
     btn.disabled = true;
-    btn.textContent = '読み取り中…';
+    btn.textContent = '読み取り中…（AIを使う場合は30秒ほどかかります）';
     try {
       const { data, error } = await sb.functions.invoke('import-url', { body: { url } });
       if (error) {
         let code = '';
         try { code = (await error.context.json()).error; } catch { /* 読めないときは空 */ }
-        const msg = {
-          no_recipe: 'このページからはレシピを読み取れませんでした。手入力で登録してください。',
-          fetch_failed: 'ページを開けませんでした。URLを確認してください。',
-          bad_url: 'URLの形が正しくありません。',
-          not_member: '家族として登録されていないアカウントです。',
-        }[code] ?? 'うまく読み取れませんでした。手入力で登録してください。';
-        toast(msg);
+        toast(importErrorMessage(code, 'このページ'));
         return;
       }
       state.draft = {
@@ -852,8 +851,9 @@ function renderImport() {
         source_type: 'url',
         source_url: url,
         source_name: data.siteName,
-        ingredients: (data.ingredients ?? []).map(splitIngredientLine),
+        ingredients: data.ingredientRows?.length ? data.ingredientRows : (data.ingredients ?? []).map(splitIngredientLine),
         steps: data.steps ?? [],
+        fromAi: data.via === 'ai',
       };
       location.hash = '#/new';
     } catch (err) {
@@ -863,6 +863,107 @@ function renderImport() {
       btn.textContent = '取り込む';
     }
   };
+}
+
+function importErrorMessage(code, what) {
+  return {
+    no_recipe: `${what}からはレシピを読み取れませんでした。手入力で登録してください。`,
+    fetch_failed: 'ページを開けませんでした。URLを確認してください。',
+    bad_url: 'URLの形が正しくありません。',
+    not_member: '家族として登録されていないアカウントです。',
+    no_api_key: 'AIの設定（APIキー）がまだです。README の手順を確認してください。',
+    ai_failed: 'AIでの読み取りに失敗しました。少し待ってからもう一度試してください。',
+    no_images: '写真を選んでください。',
+  }[code] ?? 'うまく読み取れませんでした。手入力で登録してください。';
+}
+
+// ---------------------------------------------------------------
+// 写真から取り込む（AI）
+// ---------------------------------------------------------------
+const MAX_PHOTOS = 4;
+
+function renderPhotoImport() {
+  app.innerHTML = `
+    <header class="bar">
+      <a class="icon-btn" href="#/" aria-label="戻る">‹</a>
+      <h1>写真から取り込む</h1>
+      <span class="icon-btn"></span>
+    </header>
+    ${offlineBanner()}
+    <div class="pad form">
+      <p class="hint">料理本のページ、手書きのメモ、SNSのスクショなどを撮影・選択してください。
+      2ページにまたがるときは、続けて追加すると1つのレシピにまとめます（最大${MAX_PHOTOS}枚）。</p>
+      <div class="imgs" id="picks">
+        ${photoPicks.map((p, i) => `<div class="imgbox"><img src="${p.preview}" alt="">
+          <span class="kind">${i + 1}枚目</span>
+          <button type="button" data-del="${i}" aria-label="外す">×</button></div>`).join('')}
+      </div>
+      <div class="addrow">
+        <label class="btn file">📷 撮影する<input type="file" accept="image/*" capture="environment" hidden id="cam"></label>
+        <label class="btn file">🖼 写真を選ぶ<input type="file" accept="image/*" multiple hidden id="lib"></label>
+      </div>
+      <button type="button" class="btn primary big" id="read" ${photoPicks.length ? '' : 'disabled'}>読み取る</button>
+      <p class="hint">読み取りには30秒ほどかかります。写真は「元のレシピの写真」として一緒に保存されます。</p>
+    </div>`;
+
+  const add = files => {
+    for (const f of files) {
+      if (photoPicks.length >= MAX_PHOTOS) { toast(`写真は${MAX_PHOTOS}枚までです`); break; }
+      photoPicks.push({ file: f, preview: URL.createObjectURL(f) });
+    }
+    renderPhotoImport();
+  };
+  $('#cam').onchange = e => add(e.target.files);
+  $('#lib').onchange = e => add(e.target.files);
+  $$('[data-del]').forEach(b => b.onclick = () => { photoPicks.splice(+b.dataset.del, 1); renderPhotoImport(); });
+  $('#read').onclick = readPhotos;
+}
+
+function blobToBase64(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1]);
+    r.onerror = rej;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function readPhotos() {
+  if (!requireOnline() || !photoPicks.length) return;
+  const btn = $('#read');
+  btn.disabled = true;
+  btn.textContent = '写真を準備中…';
+  try {
+    const blobs = [];
+    for (const p of photoPicks) blobs.push(await resizeImage(p.file));
+    const images = await Promise.all(blobs.map(blobToBase64));
+    btn.textContent = '読み取り中…（30秒ほどかかります）';
+    const { data, error } = await sb.functions.invoke('import-url', { body: { images } });
+    if (error) {
+      let code = '';
+      try { code = (await error.context.json()).error; } catch { /* 読めないときは空 */ }
+      toast(importErrorMessage(code, 'この写真'));
+      return;
+    }
+    state.draft = {
+      title: data.title,
+      servings_base: data.servings || 2,
+      source_type: 'photo',
+      ingredients: data.ingredientRows ?? [],
+      steps: data.steps ?? [],
+      newImages: blobs.map(b => ({ kind: 'source', file: b, preview: URL.createObjectURL(b) })),
+      fromAi: true,
+    };
+    photoPicks = [];
+    location.hash = '#/new';
+  } catch (err) {
+    fail(err);
+  } finally {
+    if (btn.isConnected) {
+      btn.disabled = false;
+      btn.textContent = '読み取る';
+    }
+  }
 }
 
 // ---------------------------------------------------------------
