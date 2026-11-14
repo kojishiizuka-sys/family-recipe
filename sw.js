@@ -1,6 +1,6 @@
 // オフラインでも開けるように、画面のファイルを保存しておく
 // ファイルを更新したら CACHE の番号を上げてください
-const CACHE = 'family-recipe-v1';
+const CACHE = 'family-recipe-v2';
 const ASSETS = [
   './',
   './index.html',
